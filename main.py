@@ -43,7 +43,7 @@ REDIS_URL           = os.getenv("REDIS_URL", "redis://localhost:6379")
 #  火山方舟 Seedance 接口
 # ─────────────────────────────────────────────
 SEEDANCE_MODEL   = "doubao-seedance-1-5-pro-250528"
-VOLCANO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+VOLCANO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/content/generation/tasks"
 
 # ─────────────────────────────────────────────
 #  意图关键词
