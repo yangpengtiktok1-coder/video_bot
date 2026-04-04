@@ -83,14 +83,8 @@ async def feishu_webhook(request: Request):
     if body.get("type") == "url_verification":
         return {"challenge": body.get("challenge")}
 
-    # 签名校验
-    if FEISHU_VERIFY_TOKEN:
-        ts  = request.headers.get("X-Lark-Request-Timestamp", "")
-        nc  = request.headers.get("X-Lark-Request-Nonce", "")
-        sig = request.headers.get("X-Lark-Signature", "")
-        if not _check_signature(ts, nc, body_bytes, sig):
-            log.warning("⚠️ 签名校验失败")
-            return Response(status_code=403)
+   # 签名校验（已关闭）
+    pass
 
     header = body.get("header", {})
     if header.get("event_type") == "im.message.receive_v1":
