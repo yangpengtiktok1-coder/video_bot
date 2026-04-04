@@ -43,7 +43,7 @@ REDIS_URL           = os.getenv("REDIS_URL", "redis://localhost:6379")
 #  火山方舟 Seedance 接口
 # ─────────────────────────────────────────────
 SEEDANCE_MODEL   = "doubao-seedance-1-5-pro-250528"
-VOLCANO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/content/generation/tasks"
+VOLCANO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
 
 # ─────────────────────────────────────────────
 #  意图关键词
@@ -209,15 +209,13 @@ async def submit_seedance(
     resolution: str = "1080p"
 ) -> Optional[str]:
     """提交生成任务，返回 task_id"""
-    payload = {
-        "model": SEEDANCE_MODEL,
-        "content": [{"type": "text", "text": prompt}],
-        "parameters": {
-            "duration":   duration,
-            "ratio":      aspect_ratio,
-            "resolution": resolution,
-            "watermark":  False,
-        }
+  payload = {
+    "model": SEEDANCE_MODEL,
+    "content": [{"type": "text", "text": prompt}],
+    "ratio":      aspect_ratio,
+    "duration":   duration,
+    "watermark":  False,
+}
     }
     headers = {
         "Authorization": f"Bearer {VOLCANO_API_KEY}",
