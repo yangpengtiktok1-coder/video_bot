@@ -25,7 +25,7 @@ FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 VOLCANO_API_KEY   = os.getenv("VOLCANO_API_KEY")
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-SEEDANCE_MODEL   = "doubao-seedance-1-5-pro-250528"
+SEEDANCE_MODEL   = "doubao-seedance-1-5-pro-251215"
 VOLCANO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
 
 GENERATE_KEYWORDS = ["生成", "制作", "创建", "做一个", "帮我做", "视频", "拍", "generate", "create", "make"]
