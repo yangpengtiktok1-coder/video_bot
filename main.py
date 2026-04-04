@@ -1,15 +1,8 @@
 """
 飞书 + 火山方舟 + Seedance 视频生成 Bot
-=========================================
-在飞书群里说话 → 自动生成视频 → 发回飞书 → 支持多轮修改
-
-启动命令：
-    uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -20,42 +13,27 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-#  从 .env 读取配置
-# ─────────────────────────────────────────────
-FEISHU_APP_ID       = os.getenv("FEISHU_APP_ID")
-FEISHU_APP_SECRET   = os.getenv("FEISHU_APP_SECRET")
-FEISHU_VERIFY_TOKEN = os.getenv("FEISHU_VERIFY_TOKEN", "")
-VOLCANO_API_KEY     = os.getenv("VOLCANO_API_KEY")
-REDIS_URL           = os.getenv("REDIS_URL", "redis://localhost:6379")
+FEISHU_APP_ID     = os.getenv("FEISHU_APP_ID")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
+VOLCANO_API_KEY   = os.getenv("VOLCANO_API_KEY")
+REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-# ─────────────────────────────────────────────
-#  火山方舟 Seedance 接口
-# ─────────────────────────────────────────────
 SEEDANCE_MODEL   = "doubao-seedance-1-5-pro-250528"
 VOLCANO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
 
-# ─────────────────────────────────────────────
-#  意图关键词
-# ─────────────────────────────────────────────
 GENERATE_KEYWORDS = ["生成", "制作", "创建", "做一个", "帮我做", "视频", "拍", "generate", "create", "make"]
 APPROVE_KEYWORDS  = ["满意", "通过", "好的", "不错", "可以", "确认", "完成", "ok", "OK", "好", "棒", "赞"]
 
-# ─────────────────────────────────────────────
-#  全局客户端
-# ─────────────────────────────────────────────
 http_client:  httpx.AsyncClient
 redis_client: aioredis.Redis
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,24 +45,22 @@ async def lifespan(app: FastAPI):
     await http_client.aclose()
     await redis_client.aclose()
 
+
 app = FastAPI(lifespan=lifespan)
 
 
-# ══════════════════════════════════════════════════════════
-#  一、接收飞书消息
-# ══════════════════════════════════════════════════════════
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": int(time.time())}
+
 
 @app.post("/feishu/event")
 async def feishu_webhook(request: Request):
     body_bytes = await request.body()
-    body       = json.loads(body_bytes)
+    body = json.loads(body_bytes)
 
-    # 飞书 URL 验证（第一次配置时）
     if body.get("type") == "url_verification":
         return {"challenge": body.get("challenge")}
-
-   # 签名校验（已关闭）
-    pass
 
     header = body.get("header", {})
     if header.get("event_type") == "im.message.receive_v1":
@@ -93,19 +69,8 @@ async def feishu_webhook(request: Request):
     return {"code": 0}
 
 
-def _check_signature(ts, nc, body_bytes, signature):
-    token   = FEISHU_VERIFY_TOKEN
-    content = (ts + nc + token).encode() + body_bytes
-    digest  = hmac.new(token.encode(), content, hashlib.sha256).hexdigest()
-    return digest == signature
-
-
-# ══════════════════════════════════════════════════════════
-#  二、判断意图，分发任务
-# ══════════════════════════════════════════════════════════
-
 async def handle_message(event: dict):
-    msg     = event.get("message", {})
+    msg = event.get("message", {})
     chat_id = msg.get("chat_id")
 
     if msg.get("message_type") != "text":
@@ -113,8 +78,8 @@ async def handle_message(event: dict):
         return
 
     raw_content = json.loads(msg.get("content", "{}"))
-    user_text   = raw_content.get("text", "").strip()
-    user_text   = user_text.replace("@_user_1", "").strip()
+    user_text = raw_content.get("text", "").strip()
+    user_text = user_text.replace("@_user_1", "").strip()
     if not user_text:
         return
 
@@ -122,7 +87,6 @@ async def handle_message(event: dict):
 
     session = await load_session(chat_id)
 
-    # 用户说满意 → 结束
     if session.get("video_url") and any(k in user_text for k in APPROVE_KEYWORDS):
         await send_card(
             chat_id,
@@ -133,18 +97,12 @@ async def handle_message(event: dict):
         await delete_session(chat_id)
         return
 
-    # 已有视频 + 不像新需求 → 修改
     if session.get("video_url") and not any(k in user_text for k in GENERATE_KEYWORDS):
         await do_modify(chat_id, session, user_text)
         return
 
-    # 其他情况 → 新建视频
     await do_generate(chat_id, user_text)
 
-
-# ══════════════════════════════════════════════════════════
-#  三、生成新视频
-# ══════════════════════════════════════════════════════════
 
 async def do_generate(chat_id: str, user_text: str):
     await send_text(chat_id, "收到！正在生成视频，大约需要 1～3 分钟，请稍候…")
@@ -166,10 +124,6 @@ async def do_generate(chat_id: str, user_text: str):
 
     asyncio.create_task(poll_and_notify(chat_id, task_id, session, is_first=True))
 
-
-# ══════════════════════════════════════════════════════════
-#  四、修改视频
-# ══════════════════════════════════════════════════════════
 
 async def do_modify(chat_id: str, session: dict, feedback: str):
     next_version = session["version"] + 1
@@ -198,24 +152,13 @@ async def do_modify(chat_id: str, session: dict, feedback: str):
     asyncio.create_task(poll_and_notify(chat_id, task_id, session, is_first=False))
 
 
-# ══════════════════════════════════════════════════════════
-#  五、调用火山方舟 Seedance API
-# ══════════════════════════════════════════════════════════
-
-async def submit_seedance(
-    prompt: str,
-    duration: int = 5,
-    aspect_ratio: str = "16:9",
-    resolution: str = "1080p"
-) -> Optional[str]:
-    """提交生成任务，返回 task_id"""
-  payload = {
-    "model": SEEDANCE_MODEL,
-    "content": [{"type": "text", "text": prompt}],
-    "ratio":      aspect_ratio,
-    "duration":   duration,
-    "watermark":  False,
-}
+async def submit_seedance(prompt: str, duration: int = 5, aspect_ratio: str = "16:9") -> Optional[str]:
+    payload = {
+        "model":     SEEDANCE_MODEL,
+        "content":   [{"type": "text", "text": prompt}],
+        "ratio":     aspect_ratio,
+        "duration":  duration,
+        "watermark": False,
     }
     headers = {
         "Authorization": f"Bearer {VOLCANO_API_KEY}",
@@ -224,7 +167,7 @@ async def submit_seedance(
     try:
         resp = await http_client.post(VOLCANO_BASE_URL, json=payload, headers=headers)
         resp.raise_for_status()
-        data    = resp.json()
+        data = resp.json()
         task_id = data.get("id")
         log.info(f"✅ 任务已提交 task_id={task_id}")
         return task_id
@@ -234,9 +177,8 @@ async def submit_seedance(
 
 
 async def query_seedance(task_id: str) -> dict:
-    """查询任务状态"""
     headers = {"Authorization": f"Bearer {VOLCANO_API_KEY}"}
-    url     = f"{VOLCANO_BASE_URL}/{task_id}"
+    url = f"{VOLCANO_BASE_URL}/{task_id}"
     try:
         resp = await http_client.get(url, headers=headers)
         resp.raise_for_status()
@@ -246,15 +188,11 @@ async def query_seedance(task_id: str) -> dict:
         return {}
 
 
-# ══════════════════════════════════════════════════════════
-#  六、轮询等待 + 完成后通知飞书
-# ══════════════════════════════════════════════════════════
-
 async def poll_and_notify(chat_id: str, task_id: str, session: dict, is_first: bool):
-    max_seconds = 600   # 最多等 10 分钟
-    interval    = 15    # 每 15 秒查一次
-    elapsed     = 0
-    version     = session["version"] + 1
+    max_seconds = 600
+    interval = 15
+    elapsed = 0
+    version = session["version"] + 1
 
     while elapsed < max_seconds:
         await asyncio.sleep(interval)
@@ -268,7 +206,7 @@ async def poll_and_notify(chat_id: str, task_id: str, session: dict, is_first: b
             video_url = result.get("content", {}).get("video_url")
             if video_url:
                 session["video_url"] = video_url
-                session["version"]   = version
+                session["version"] = version
                 await save_session(chat_id, session)
                 await notify_done(chat_id, video_url, version, is_first)
             else:
@@ -287,11 +225,8 @@ async def poll_and_notify(chat_id: str, task_id: str, session: dict, is_first: b
     await send_text(chat_id, "视频生成超时（超过 10 分钟），请重新发送需求。")
 
 
-# ══════════════════════════════════════════════════════════
-#  七、发送飞书消息
-# ══════════════════════════════════════════════════════════
-
 _token_cache: dict = {"token": "", "expires": 0}
+
 
 async def get_feishu_token() -> str:
     now = time.time()
@@ -302,7 +237,7 @@ async def get_feishu_token() -> str:
         json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}
     )
     data = resp.json()
-    _token_cache["token"]   = data.get("tenant_access_token", "")
+    _token_cache["token"] = data.get("tenant_access_token", "")
     _token_cache["expires"] = now + data.get("expire", 7200)
     return _token_cache["token"]
 
@@ -322,7 +257,7 @@ async def send_text(chat_id: str, text: str):
 
 async def send_card(chat_id: str, title: str, body: str, color: str = "blue"):
     token = await get_feishu_token()
-    card  = {
+    card = {
         "config": {"wide_screen_mode": True},
         "header": {
             "title":    {"tag": "plain_text", "content": title},
@@ -344,7 +279,7 @@ async def send_card(chat_id: str, title: str, body: str, color: str = "blue"):
 async def notify_done(chat_id: str, video_url: str, version: int, is_first: bool):
     title = "首版视频已生成 🎬" if is_first else f"第 {version} 版视频已生成 ✨"
     color = "blue" if is_first else "turquoise"
-    body  = (
+    body = (
         f"**点击查看视频：**\n{video_url}\n\n"
         "---\n"
         "**满意了吗？**\n"
@@ -354,15 +289,13 @@ async def notify_done(chat_id: str, video_url: str, version: int, is_first: bool
     await send_card(chat_id, title=title, body=body, color=color)
 
 
-# ══════════════════════════════════════════════════════════
-#  八、会话状态（存 Redis，24 小时有效）
-# ══════════════════════════════════════════════════════════
-
 SESSION_TTL = 86400
+
 
 async def load_session(chat_id: str) -> dict:
     raw = await redis_client.get(f"session:{chat_id}")
     return json.loads(raw) if raw else {}
+
 
 async def save_session(chat_id: str, session: dict):
     await redis_client.setex(
@@ -371,14 +304,6 @@ async def save_session(chat_id: str, session: dict):
         json.dumps(session, ensure_ascii=False)
     )
 
+
 async def delete_session(chat_id: str):
     await redis_client.delete(f"session:{chat_id}")
-
-
-# ══════════════════════════════════════════════════════════
-#  九、健康检查
-# ══════════════════════════════════════════════════════════
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "time": int(time.time())}
