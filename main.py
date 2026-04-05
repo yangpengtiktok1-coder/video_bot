@@ -39,6 +39,12 @@ VOLCANO_VIDEO_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generatio
 CLAUDE_API_URL    = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL      = "claude-sonnet-4-5"
 
+# 火山引擎 TOS 配置
+TOS_ACCESS_KEY = os.getenv("TOS_ACCESS_KEY")
+TOS_SECRET_KEY = os.getenv("TOS_SECRET_KEY")
+TOS_BUCKET     = os.getenv("TOS_BUCKET")
+TOS_ENDPOINT   = os.getenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+
 STATE_CHATTING   = "chatting"
 STATE_GENERATING = "generating"
 
@@ -78,6 +84,8 @@ DIRECTOR_PROMPT = """你是一位专业的视频导演助手，通过飞书和�
 [SEEDANCE_END]
 [DURATION:5]
 [RATIO:9:16]
+
+注意：DURATION 只能填 4、5、6、8、10 这几个数字，不能填其他值。
 
 ## 重要原则
 
@@ -218,14 +226,21 @@ async def handle_text(chat_id: str, session: dict, text: str):
 async def handle_image(chat_id: str, session: dict, msg: dict, raw_content: dict):
     await send_text(chat_id, "收到图片，正在分析…")
 
-    # 从飞书下载图片
-    image_key = raw_content.get("image_key", "")
-    image_data = await download_feishu_image(msg.get("message_id", ""), image_key)
-
-    history = session.get("history", [])
+    image_key  = raw_content.get("image_key", "")
+    message_id = msg.get("message_id", "")
+    image_data = await download_feishu_image(message_id, image_key)
+    history    = session.get("history", [])
 
     if image_data:
-        # 把图片以 base64 形式发给 Claude 分析
+        # 1. 上传到 TOS 拿到公开 URL（供 Seedance 图生视频用）
+        filename  = f"ref_image_{chat_id}_{int(time.time())}.jpg"
+        image_url = await upload_to_tos(base64.b64decode(image_data), filename, "image/jpeg")
+        if image_url:
+            session["ref_image_url"]  = image_url
+            session["ref_image_file"] = filename  # 记录文件名，用于后续删除
+            log.info(f"图片已保存到 TOS：{image_url}")
+
+        # 2. 同时把图片发给 Claude 分析
         message_content = [
             {
                 "type": "image",
@@ -237,25 +252,118 @@ async def handle_image(chat_id: str, session: dict, msg: dict, raw_content: dict
             },
             {
                 "type": "text",
-                "text": "用户上传了这张图片作为视频参考素材。请仔细分析图片内容、风格、色调、主体，告诉用户你看到了什么，以及你打算如何将它融入视频创作中。"
+                "text": "用户上传了这张图片作为视频素材，将以此图片为基础生成视频（图生视频模式）。请仔细分析图片内容、风格、色调、主体，告诉用户你看到了什么，以及你打算如何以这张图片为首帧来创作视频脚本。"
             }
         ]
         history.append({"role": "user", "content": message_content})
     else:
-        # 图片下载失败，告知用户
         history.append({
             "role": "user",
-            "content": "用户上传了一张参考图片（下载失败，请用文字描述图片内容）。"
+            "content": "用户上传了一张参考图片（下载失败）。请告知用户图片下载失败，可以重新发送，或用文字描述图片内容。"
         })
 
     reply = await claude_chat(history, system=DIRECTOR_PROMPT)
     history.append({"role": "assistant", "content": reply})
-
     session["history"] = history[-20:]
     session["state"]   = STATE_CHATTING
     await save_session(chat_id, session)
-
     await send_text(chat_id, reply)
+
+
+async def upload_to_tos(file_bytes: bytes, filename: str, content_type: str = "image/jpeg") -> Optional[str]:
+    """上传文件到火山引擎 TOS，返回公开访问 URL"""
+    try:
+        import hmac as hmac_lib
+        import hashlib
+        from datetime import datetime, timezone
+
+        now       = datetime.now(timezone.utc)
+        date_str  = now.strftime("%Y%m%d")
+        time_str  = now.strftime("%Y%m%dT%H%M%SZ")
+        host      = f"{TOS_BUCKET}.{TOS_ENDPOINT}"
+        url       = f"https://{host}/{filename}"
+
+        # 构建签名（TOS V4 签名）
+        canonical_request = (
+            f"PUT\n/{filename}\n\n"
+            f"content-type:{content_type}\n"
+            f"host:{host}\n"
+            f"x-tos-date:{time_str}\n\n"
+            f"content-type;host;x-tos-date\n"
+            + hashlib.sha256(file_bytes).hexdigest()
+        )
+        credential_scope  = f"{date_str}/cn-beijing/tos/request"
+        string_to_sign    = f"TOS4-HMAC-SHA256\n{time_str}\n{credential_scope}\n" + hashlib.sha256(canonical_request.encode()).hexdigest()
+
+        def hmac_sha256(key, msg):
+            return hmac_lib.new(key if isinstance(key, bytes) else key.encode(), msg.encode(), hashlib.sha256).digest()
+
+        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "cn-beijing"), "tos"), "request")
+        signature   = hmac_lib.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+        auth = (
+            f"TOS4-HMAC-SHA256 Credential={TOS_ACCESS_KEY}/{credential_scope},"
+            f"SignedHeaders=content-type;host;x-tos-date,Signature={signature}"
+        )
+
+        resp = await http_client.put(
+            url,
+            content=file_bytes,
+            headers={
+                "Host":          host,
+                "Content-Type":  content_type,
+                "x-tos-date":    time_str,
+                "Authorization": auth,
+            }
+        )
+        if resp.status_code in (200, 204):
+            log.info(f"✅ TOS 上传成功：{url}")
+            return url
+        else:
+            log.error(f"❌ TOS 上传失败：{resp.status_code} {resp.text}")
+            return None
+    except Exception as e:
+        log.error(f"❌ TOS 上传异常：{e}")
+        return None
+
+
+async def delete_from_tos(filename: str):
+    """生成完视频后删除 TOS 临时文件"""
+    try:
+        import hmac as hmac_lib
+        import hashlib
+        from datetime import datetime, timezone
+
+        now      = datetime.now(timezone.utc)
+        date_str = now.strftime("%Y%m%d")
+        time_str = now.strftime("%Y%m%dT%H%M%SZ")
+        host     = f"{TOS_BUCKET}.{TOS_ENDPOINT}"
+        url      = f"https://{host}/{filename}"
+
+        canonical_request = (
+            f"DELETE\n/{filename}\n\n"
+            f"host:{host}\n"
+            f"x-tos-date:{time_str}\n\n"
+            f"host;x-tos-date\n"
+            + hashlib.sha256(b"").hexdigest()
+        )
+        credential_scope = f"{date_str}/cn-beijing/tos/request"
+        string_to_sign   = f"TOS4-HMAC-SHA256\n{time_str}\n{credential_scope}\n" + hashlib.sha256(canonical_request.encode()).hexdigest()
+
+        def hmac_sha256(key, msg):
+            return hmac_lib.new(key if isinstance(key, bytes) else key.encode(), msg.encode(), hashlib.sha256).digest()
+
+        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "cn-beijing"), "tos"), "request")
+        signature   = hmac_lib.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+        auth = (
+            f"TOS4-HMAC-SHA256 Credential={TOS_ACCESS_KEY}/{credential_scope},"
+            f"SignedHeaders=host;x-tos-date,Signature={signature}"
+        )
+        await http_client.delete(url, headers={"Host": host, "x-tos-date": time_str, "Authorization": auth})
+        log.info(f"🗑 TOS 文件已删除：{filename}")
+    except Exception as e:
+        log.error(f"TOS 删除失败：{e}")
 
 
 async def download_feishu_image(message_id: str, image_key: str) -> Optional[str]:
@@ -278,24 +386,28 @@ async def download_feishu_image(message_id: str, image_key: str) -> Optional[str
 # ══════════════════════════════════════════════════════════
 
 async def handle_video(chat_id: str, session: dict, msg: dict, raw_content: dict):
-    """处理视频消息：抽帧给 Claude 分析，同时保存视频 URL 供 Seedance 参考"""
+    """处理视频消息：抽帧给 Claude 分析，同时上传到 TOS 供 Seedance 参考"""
     await send_text(chat_id, "收到视频，正在处理…")
 
-    message_id = msg.get("message_id", "")
-    file_key   = raw_content.get("file_key", "")
-
-    # 从飞书下载视频文件
+    message_id  = msg.get("message_id", "")
+    file_key    = raw_content.get("file_key", "")
     video_bytes = await download_feishu_file(message_id, file_key)
-    history = session.get("history", [])
+    history     = session.get("history", [])
 
     if video_bytes:
-        # 用 ffmpeg 抽取 3 帧关键画面
-        frames = await extract_video_frames(video_bytes)
+        # 1. 上传到 TOS 拿到公开 URL（供 Seedance 视频生视频用）
+        filename  = f"ref_video_{chat_id}_{int(time.time())}.mp4"
+        video_url = await upload_to_tos(video_bytes, filename, "video/mp4")
+        if video_url:
+            session["ref_video_url"]  = video_url
+            session["ref_video_file"] = filename
+            log.info(f"视频已保存到 TOS：{video_url}")
 
+        # 2. 用 ffmpeg 抽帧给 Claude 分析
+        frames = await extract_video_frames(video_bytes)
         if frames:
-            # 把帧图片发给 Claude 分析
             content = []
-            for i, frame_b64 in enumerate(frames):
+            for frame_b64 in frames:
                 content.append({
                     "type": "image",
                     "source": {
@@ -306,22 +418,18 @@ async def handle_video(chat_id: str, session: dict, msg: dict, raw_content: dict
                 })
             content.append({
                 "type": "text",
-                "text": f"用户上传了一段参考视频，我已从中提取了 {len(frames)} 帧关键画面（开头、中间、结尾）。请仔细分析视频的画面风格、色调、镜头语言、主体内容，告诉用户你看到了什么，以及你打算如何将这个视频的风格或内容融入新的视频创作中。"
+                "text": f"用户上传了一段参考视频（已提取{len(frames)}帧），将以此视频为参考素材生成新视频（视频生视频模式）。请分析视频的画面风格、色调、镜头语言、主体内容，告诉用户你看到了什么，以及你打算如何参考这个视频来创作新的视频脚本。"
             })
             history.append({"role": "user", "content": content})
-
-            # 同时保存视频信息供 Seedance 参考
-            session["reference_video"] = f"用户上传的参考视频（已分析{len(frames)}帧）"
         else:
-            # ffmpeg 抽帧失败，降级处理
             history.append({
                 "role": "user",
-                "content": "用户上传了一段参考视频（视频帧提取失败）。请告知用户视频已收到但无法预览，请用文字描述视频的风格和内容，我会按照描述来创作。"
+                "content": "用户上传了一段参考视频（帧提取失败，但视频已保存）。请告知用户视频已收到，请用文字补充描述视频的风格和内容。"
             })
     else:
         history.append({
             "role": "user",
-            "content": "用户上传了一段参考视频（下载失败）。请告知用户视频下载失败，可以尝试重新发送，或用文字描述视频内容。"
+            "content": "用户上传了一段参考视频（下载失败）。请告知用户重新发送，或用文字描述视频内容。"
         })
 
     reply = await claude_chat(history, system=DIRECTOR_PROMPT)
@@ -394,12 +502,23 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
         end   = reply.index("[SEEDANCE_END]")
         prompt = reply[start:end].strip()
 
-        # 解析时长
+        # 解析时长（Seedance 只支持 4/5/6/8/10 秒）
+        valid_durations = [4, 5, 6, 8, 10]
         duration = 5
         if "[DURATION:" in reply:
             d_start = reply.index("[DURATION:") + len("[DURATION:")
             d_end   = reply.index("]", d_start)
-            duration = int(reply[d_start:d_end])
+            raw_dur = int(reply[d_start:d_end])
+            if raw_dur not in valid_durations:
+                session["history"] = history[-20:]
+                session["state"]   = STATE_CHATTING
+                await save_session(chat_id, session)
+                await send_text(chat_id,
+                    f"脚本里的时长是 {raw_dur} 秒，但 Seedance 只支持 4、5、6、8、10 秒。\n\n"
+                    f"请告诉我改成几秒？修改后重新回复「确认拍摄」。"
+                )
+                return
+            duration = raw_dur
 
         # 解析比例
         ratio = "9:16"
@@ -415,6 +534,20 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
         await send_text(chat_id, "脚本格式有点问题，Claude 正在重新整理，请稍候…")
         return
 
+    # 从 session 取出用户上传的素材 URL
+    ref_image_url = session.get("ref_image_url")
+    ref_video_url = session.get("ref_video_url")
+
+    # 告知用户使用了哪种模式
+    if ref_image_url and ref_video_url:
+        mode_text = "图片 + 视频参考"
+    elif ref_image_url:
+        mode_text = "以你的图片为素材"
+    elif ref_video_url:
+        mode_text = "以你的视频为参考"
+    else:
+        mode_text = "纯文字脚本"
+
     # 保存当前版本信息
     version = session.get("version", 0) + 1
     session["history"]        = history[-20:]
@@ -423,17 +556,25 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
     session["duration"]       = duration
     session["ratio"]          = ratio
     session["version"]        = version
-    if "video_url" not in session:
-        session["video_url"] = None
+    if "result_video_url" not in session:
+        session["result_video_url"] = None
     await save_session(chat_id, session)
 
     is_first = version == 1
     await send_text(chat_id,
-        f"好！开始拍摄{'首版' if is_first else f'第{version}版'}视频，大约需要 1～3 分钟，请稍候…"
+        f"好！开始拍摄{'首版' if is_first else f'第{version}版'}视频\n"
+        f"模式：{mode_text}\n"
+        f"大约需要 1～3 分钟，请稍候…"
     )
 
     # 提交任务
-    task_id = await submit_seedance(prompt, duration=duration, aspect_ratio=ratio)
+    task_id = await submit_seedance(
+        prompt,
+        duration=duration,
+        aspect_ratio=ratio,
+        image_url=ref_image_url,
+        video_url=ref_video_url
+    )
     if not task_id:
         session["state"] = STATE_CHATTING
         await save_session(chat_id, session)
@@ -473,10 +614,45 @@ async def claude_chat(messages: list, system: str = DIRECTOR_PROMPT) -> str:
 #  Seedance API
 # ══════════════════════════════════════════════════════════
 
-async def submit_seedance(prompt: str, duration: int = 5, aspect_ratio: str = "9:16") -> Optional[str]:
+async def submit_seedance(
+    prompt: str,
+    duration: int = 5,
+    aspect_ratio: str = "9:16",
+    image_url: str = None,
+    video_url: str = None
+) -> Optional[str]:
+    """
+    提交 Seedance 任务，支持三种模式：
+    - 文生视频：只有 prompt
+    - 图生视频：image_url + prompt
+    - 视频生视频：video_url + prompt
+    - 混合：image_url + video_url + prompt
+    """
+    # 构建 content 列表
+    content = []
+
+    if image_url:
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
+        log.info(f"图生视频模式，图片：{image_url[:50]}")
+
+    if video_url:
+        content.append({"type": "video_url", "video_url": {"url": video_url}})
+        log.info(f"视频参考模式，视频：{video_url[:50]}")
+
+    content.append({"type": "text", "text": prompt})
+
+    mode = "文生视频"
+    if image_url and video_url:
+        mode = "图+视频生视频"
+    elif image_url:
+        mode = "图生视频"
+    elif video_url:
+        mode = "视频生视频"
+    log.info(f"Seedance 模式：{mode}")
+
     payload = {
         "model":     SEEDANCE_MODEL,
-        "content":   [{"type": "text", "text": prompt}],
+        "content":   content,
         "ratio":     aspect_ratio,
         "duration":  duration,
         "watermark": False,
@@ -531,6 +707,12 @@ async def poll_and_notify(chat_id: str, task_id: str, session: dict, is_first: b
                 session["video_url"] = video_url
                 session["state"]     = STATE_CHATTING
                 await save_session(chat_id, session)
+
+                # 自动清理 TOS 临时素材（节省存储费用）
+                if session.get("ref_image_file"):
+                    asyncio.create_task(delete_from_tos(session["ref_image_file"]))
+                if session.get("ref_video_file"):
+                    asyncio.create_task(delete_from_tos(session["ref_video_file"]))
 
                 # 把视频结果告知 Claude，让它来回复用户
                 history = session.get("history", [])
