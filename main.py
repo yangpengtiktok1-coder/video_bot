@@ -32,7 +32,7 @@ VOLCANO_API_KEY   = os.getenv("VOLCANO_API_KEY")
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 SEEDANCE_MODEL  = "doubao-seedance-1-5-pro-251215"
-DOUBAO_MODEL    = "doubao-1-5-pro-256k-250115"
+DOUBAO_MODEL    = "doubao-1-5-pro-32k-250115"
 VOLCANO_VIDEO_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
 VOLCANO_CHAT_URL  = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 
