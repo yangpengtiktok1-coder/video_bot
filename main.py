@@ -136,12 +136,12 @@ async def handle_message(event: dict):
 
     raw_content = json.loads(msg.get("content", "{}"))
 
-    # ── @ 规则：文字消息必须 @，图片消息直接处理 ──
+    # ── @ 规则：文字消息必须 @，图片和视频素材直接处理 ──
     if chat_type == "group" and msg_type == "text":
         text_check = raw_content.get("text", "")
         if "@_user_1" not in text_check:
             return  # 文字消息没有 @，忽略
-    # 图片消息不需要 @，直接处理
+    # 图片和视频消息不需要 @，直接处理
 
     session = await load_session(chat_id)
     state   = session.get("state", STATE_CHATTING)
@@ -175,9 +175,14 @@ async def handle_message(event: dict):
         log.info(f"[chat={chat_id}] 收到图片")
         await handle_image(chat_id, session, msg, raw_content)
 
+    # ── 处理视频消息 ──
+    elif msg_type == "media":
+        log.info(f"[chat={chat_id}] 收到视频")
+        await handle_video(chat_id, session, msg, raw_content)
+
     # ── 其他类型 ──
     else:
-        await send_text(chat_id, "目前支持文字和图片消息哦～")
+        await send_text(chat_id, "目前支持文字、图片和视频消息～")
 
 
 # ══════════════════════════════════════════════════════════
@@ -271,6 +276,115 @@ async def download_feishu_image(message_id: str, image_key: str) -> Optional[str
 # ══════════════════════════════════════════════════════════
 #  检测到 Seedance 指令，执行拍摄
 # ══════════════════════════════════════════════════════════
+
+async def handle_video(chat_id: str, session: dict, msg: dict, raw_content: dict):
+    """处理视频消息：抽帧给 Claude 分析，同时保存视频 URL 供 Seedance 参考"""
+    await send_text(chat_id, "收到视频，正在处理…")
+
+    message_id = msg.get("message_id", "")
+    file_key   = raw_content.get("file_key", "")
+
+    # 从飞书下载视频文件
+    video_bytes = await download_feishu_file(message_id, file_key)
+    history = session.get("history", [])
+
+    if video_bytes:
+        # 用 ffmpeg 抽取 3 帧关键画面
+        frames = await extract_video_frames(video_bytes)
+
+        if frames:
+            # 把帧图片发给 Claude 分析
+            content = []
+            for i, frame_b64 in enumerate(frames):
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type":       "base64",
+                        "media_type": "image/jpeg",
+                        "data":       frame_b64
+                    }
+                })
+            content.append({
+                "type": "text",
+                "text": f"用户上传了一段参考视频，我已从中提取了 {len(frames)} 帧关键画面（开头、中间、结尾）。请仔细分析视频的画面风格、色调、镜头语言、主体内容，告诉用户你看到了什么，以及你打算如何将这个视频的风格或内容融入新的视频创作中。"
+            })
+            history.append({"role": "user", "content": content})
+
+            # 同时保存视频信息供 Seedance 参考
+            session["reference_video"] = f"用户上传的参考视频（已分析{len(frames)}帧）"
+        else:
+            # ffmpeg 抽帧失败，降级处理
+            history.append({
+                "role": "user",
+                "content": "用户上传了一段参考视频（视频帧提取失败）。请告知用户视频已收到但无法预览，请用文字描述视频的风格和内容，我会按照描述来创作。"
+            })
+    else:
+        history.append({
+            "role": "user",
+            "content": "用户上传了一段参考视频（下载失败）。请告知用户视频下载失败，可以尝试重新发送，或用文字描述视频内容。"
+        })
+
+    reply = await claude_chat(history, system=DIRECTOR_PROMPT)
+    history.append({"role": "assistant", "content": reply})
+    session["history"] = history[-20:]
+    session["state"]   = STATE_CHATTING
+    await save_session(chat_id, session)
+    await send_text(chat_id, reply)
+
+
+async def download_feishu_file(message_id: str, file_key: str) -> Optional[bytes]:
+    """从飞书下载文件，返回原始字节"""
+    try:
+        token = await get_feishu_token()
+        url   = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+        resp  = await http_client.get(url, headers={"Authorization": f"Bearer {token}"})
+        if resp.status_code == 200:
+            return resp.content
+        log.error(f"视频下载失败：{resp.status_code}")
+        return None
+    except Exception as e:
+        log.error(f"视频下载异常：{e}")
+        return None
+
+
+async def extract_video_frames(video_bytes: bytes) -> list:
+    """用 ffmpeg 从视频中抽取 3 帧，返回 base64 列表"""
+    import tempfile, subprocess, os
+    frames = []
+    try:
+        # 写入临时文件
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_bytes)
+            video_path = vf.name
+
+        # 抽取 3 帧：开头、中间、结尾
+        for i, timestamp in enumerate(["00:00:00", "50%", "99%"]):
+            out_path = f"{video_path}_frame{i}.jpg"
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", timestamp if "%" not in timestamp else "0",
+                "-i", video_path,
+                "-vframes", "1",
+                "-q:v", "2",
+                out_path
+            ]
+            if "%" in timestamp:
+                # 用 -sseof 取结尾帧
+                cmd = ["ffmpeg", "-y", "-sseof", "-1", "-i", video_path, "-vframes", "1", "-q:v", "2", out_path]
+
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if result.returncode == 0 and os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    frames.append(base64.b64encode(f.read()).decode("utf-8"))
+                os.remove(out_path)
+
+        os.remove(video_path)
+        log.info(f"成功提取 {len(frames)} 帧")
+    except Exception as e:
+        log.error(f"ffmpeg 抽帧失败：{e}")
+
+    return frames
+
 
 async def handle_seedance_trigger(chat_id: str, session: dict, history: list, reply: str):
     """Claude 输出了拍摄指令，解析并提交 Seedance 任务"""
