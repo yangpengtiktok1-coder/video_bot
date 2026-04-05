@@ -487,7 +487,9 @@ async def submit_seedance(prompt: str, duration: int = 5, aspect_ratio: str = "9
     }
     try:
         resp = await http_client.post(VOLCANO_VIDEO_URL, json=payload, headers=headers)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log.error(f"❌ Seedance 返回错误：{resp.status_code} {resp.text}")
+            resp.raise_for_status()
         data    = resp.json()
         task_id = data.get("id")
         log.info(f"✅ 视频任务已提交 task_id={task_id}")
