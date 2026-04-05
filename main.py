@@ -136,11 +136,12 @@ async def handle_message(event: dict):
 
     raw_content = json.loads(msg.get("content", "{}"))
 
-    # ── 必须 @ 才回复（群聊）──
-    if chat_type == "group":
+    # ── @ 规则：文字消息必须 @，图片消息直接处理 ──
+    if chat_type == "group" and msg_type == "text":
         text_check = raw_content.get("text", "")
         if "@_user_1" not in text_check:
-            return
+            return  # 文字消息没有 @，忽略
+    # 图片消息不需要 @，直接处理
 
     session = await load_session(chat_id)
     state   = session.get("state", STATE_CHATTING)
