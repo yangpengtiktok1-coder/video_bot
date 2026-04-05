@@ -1,11 +1,8 @@
 """
-飞书 + 豆包（意图理解）+ Seedance（视频生成）Bot
-对话流程：
-  1. 豆包理解意图
-  2. 引导用户填写脚本
-  3. 生成前展示脚本让用户确认
-  4. 用户说「确认」才调用 Seedance
-  5. 修改时也先确认再生成
+飞书 + Claude（大脑）+ Seedance（视频生成）Bot
+规则：
+  1. 必须 @ 机器人才回复
+  2. 必须明确说「确认」才开始生成视频
 """
 
 import asyncio
@@ -29,20 +26,43 @@ log = logging.getLogger(__name__)
 FEISHU_APP_ID     = os.getenv("FEISHU_APP_ID")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 VOLCANO_API_KEY   = os.getenv("VOLCANO_API_KEY")
+CLAUDE_API_KEY    = os.getenv("CLAUDE_API_KEY")
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-SEEDANCE_MODEL  = "doubao-seedance-1-5-pro-251215"
-DOUBAO_MODEL    = "doubao-1-5-pro-32k-250115"
+SEEDANCE_MODEL    = "doubao-seedance-1-5-pro-251215"
 VOLCANO_VIDEO_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
-VOLCANO_CHAT_URL  = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+CLAUDE_API_URL    = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL      = "claude-sonnet-4-5"
 
 # 会话状态
-STATE_IDLE      = "idle"        # 待机
-STATE_COLLECT   = "collecting"  # 收集脚本中
-STATE_CONFIRM   = "confirming"  # 等待用户确认脚本
-STATE_GENERATING = "generating" # 生成中
-STATE_REVIEW    = "reviewing"   # 审核视频中
-STATE_MOD_CONFIRM = "mod_confirming" # 等待用户确认修改脚本
+STATE_IDLE         = "idle"
+STATE_CREATING     = "creating"
+STATE_SCRIPT_READY = "script_ready"
+STATE_GENERATING   = "generating"
+STATE_REVIEW       = "reviewing"
+STATE_MOD_CONFIRM  = "mod_confirming"
+
+# 明确确认的关键词（严格匹配，避免误触发）
+CONFIRM_KEYWORDS = ["确认", "确定", "开始生成", "开始吧", "可以生成", "生成吧"]
+CANCEL_KEYWORDS  = ["取消", "不了", "算了", "不要", "停止"]
+APPROVE_KEYWORDS = ["满意", "完成", "通过", "就这个", "好了"]
+
+SYSTEM_PROMPT = """你是一个专业的视频创作助手，帮助用户创作视频脚本并生成视频。
+
+你的工作流程：
+1. 了解用户的视频需求（产品/主题、目标受众、风格、时长、横竖屏）
+2. 根据需求创作专业的逐秒分镜脚本
+3. 等用户明确说「确认」后，才开始生成视频
+
+重要规则：
+- 不要主动询问用户是否确认，等用户自己说「确认」
+- 脚本展示完后，告诉用户：满意请回复「确认」开始生成，需要修改请直接告诉我
+- 回复要简洁专业，用中文
+
+创作脚本时要：
+- 每秒都有具体的画面描述
+- 包含镜头运动（推近、拉远、环绕等）
+- 包含光线和氛围描述"""
 
 http_client:  httpx.AsyncClient
 redis_client: aioredis.Redis
@@ -88,11 +108,22 @@ async def handle_message(event: dict):
     chat_id = msg.get("chat_id")
 
     if msg.get("message_type") != "text":
-        await send_text(chat_id, "目前只支持文字消息哦～")
         return
 
     raw = json.loads(msg.get("content", "{}"))
     user_text = raw.get("text", "").strip()
+
+    # ── 关键规则：必须 @ 机器人才回复 ──
+    # 飞书群消息中，@ 机器人的消息 text 里会包含 @_user_1 或类似标记
+    # 如果是单聊则不需要 @ 直接回复
+    msg_type = msg.get("chat_type", "group")
+    is_mentioned = "@_user_1" in user_text or msg_type == "p2p"
+
+    if not is_mentioned:
+        log.info(f"[chat={chat_id}] 未被@，忽略消息")
+        return
+
+    # 清除 @ 标记，获取纯文本
     user_text = user_text.replace("@_user_1", "").strip()
     if not user_text:
         return
@@ -101,15 +132,11 @@ async def handle_message(event: dict):
     session = await load_session(chat_id)
     state = session.get("state", STATE_IDLE)
 
-    # 根据当前状态分发处理
-    if state == STATE_IDLE:
-        await handle_idle(chat_id, session, user_text)
+    if state == STATE_IDLE or state == STATE_CREATING:
+        await handle_creating(chat_id, session, user_text)
 
-    elif state == STATE_COLLECT:
-        await handle_collect(chat_id, session, user_text)
-
-    elif state == STATE_CONFIRM:
-        await handle_confirm(chat_id, session, user_text)
+    elif state == STATE_SCRIPT_READY:
+        await handle_script_confirm(chat_id, session, user_text)
 
     elif state == STATE_REVIEW:
         await handle_review(chat_id, session, user_text)
@@ -117,285 +144,272 @@ async def handle_message(event: dict):
     elif state == STATE_MOD_CONFIRM:
         await handle_mod_confirm(chat_id, session, user_text)
 
-
-# ══════════════════════════════════════════════════════════
-#  状态1：待机 - 豆包判断意图
-# ══════════════════════════════════════════════════════════
-
-async def handle_idle(chat_id: str, session: dict, user_text: str):
-    intent = await detect_intent(user_text)
-
-    if intent == "make_video":
-        # 想做视频，进入收集脚本状态
-        session["state"] = STATE_COLLECT
-        session["script_draft"] = {}
-        await save_session(chat_id, session)
-        await send_text(chat_id,
-            "好的！我来帮你生成视频。\n\n"
-            "请告诉我以下信息（可以一次说完，也可以逐条回答）：\n\n"
-            "1. 画面内容是什么？\n"
-            "2. 风格偏好？（科技感 / 温馨 / 活力 / 写实 等）\n"
-            "3. 时长？（5秒 或 10秒）\n"
-            "4. 横屏（16:9）还是竖屏（9:16）？"
-        )
-    else:
-        # 普通对话，豆包直接回复
-        reply = await doubao_chat(user_text,
-            system="你是一个视频生成助手，可以帮用户生成视频。"
-                   "如果用户想做视频，引导他们描述视频需求。"
-                   "其他问题正常回答，保持友好简洁。"
-        )
-        await send_text(chat_id, reply)
+    elif state == STATE_GENERATING:
+        await send_text(chat_id, "视频正在生成中，请稍候…")
 
 
 # ══════════════════════════════════════════════════════════
-#  状态2：收集脚本 - 豆包提取信息
+#  状态1+2：对话创作脚本
 # ══════════════════════════════════════════════════════════
 
-async def handle_collect(chat_id: str, session: dict, user_text: str):
-    # 用豆包从用户描述中提取脚本要素
-    extract_prompt = f"""用户想做一个视频，他说：「{user_text}」
+async def handle_creating(chat_id: str, session: dict, user_text: str):
+    history = session.get("chat_history", [])
+    history.append({"role": "user", "content": user_text})
 
-请从中提取以下信息，用JSON格式返回，只返回JSON不要其他内容：
-{{
-  "scene": "画面内容描述（如果用户没说则为null）",
-  "style": "风格（如果用户没说则为null）",
-  "duration": 5或10（秒，如果用户没说则为null）,
-  "ratio": "16:9或9:16（如果用户没说则为null）",
-  "complete": true或false（四项信息是否都齐全）
-}}"""
+    # 判断信息是否足够
+    judge_prompt = history + [{
+        "role": "user",
+        "content": "【系统判断】根据以上对话，你是否已经收集到足够信息可以创作完整的视频脚本了？只回答 YES 或 NO。"
+    }]
+    judge = await claude_chat(judge_prompt, system="只回答YES或NO，不要其他内容。")
 
-    result_str = await doubao_chat(extract_prompt, system="你是信息提取助手，只输出JSON。")
+    if "YES" in judge.upper():
+        # 生成专业脚本
+        script_prompt = history + [{
+            "role": "user",
+            "content": """【系统指令】请根据以上对话内容，创作专业的视频脚本。
 
-    try:
-        result_str = result_str.strip()
-        if result_str.startswith("```"):
-            result_str = result_str.split("```")[1]
-            if result_str.startswith("json"):
-                result_str = result_str[4:]
-        info = json.loads(result_str.strip())
-    except Exception:
-        info = {"complete": False}
+格式要求：
+逐秒分镜（每秒一行），然后一行写参数，然后写 ---PROMPT--- 分隔线，最后写Seedance提示词。
 
-    # 合并到已有草稿
-    draft = session.get("script_draft", {})
-    if info.get("scene"):
-        draft["scene"] = info["scene"]
-    if info.get("style"):
-        draft["style"] = info["style"]
-    if info.get("duration"):
-        draft["duration"] = info["duration"]
-    if info.get("ratio"):
-        draft["ratio"] = info["ratio"]
-    session["script_draft"] = draft
+示例：
+【第1秒】黑色背景，产品从中心渐现，光线汇聚
+【第2秒】镜头推近展示产品细节
+【第3秒】产品360°旋转，质感特写
+【第4秒】镜头拉远，产品悬浮光粒子中
+【第5秒】品牌感收尾，画面渐暗
 
-    # 检查缺少哪些信息
-    missing = []
-    if not draft.get("scene"):
-        missing.append("画面内容是什么？")
-    if not draft.get("style"):
-        missing.append("风格偏好？（科技感 / 温馨 / 活力 / 写实）")
-    if not draft.get("duration"):
-        missing.append("时长？（5秒 或 10秒）")
-    if not draft.get("ratio"):
-        missing.append("横屏（16:9）还是竖屏（9:16）？")
+风格：科技感 | 时长：5s | 比例：9:16
 
-    if missing:
-        # 还有信息没收集到
-        await save_session(chat_id, session)
-        reply = "好的，还需要以下信息：\n\n"
-        for i, q in enumerate(missing, 1):
-            reply += f"{i}. {q}\n"
-        await send_text(chat_id, reply)
-    else:
-        # 信息收集完整，展示脚本让用户确认
-        session["state"] = STATE_CONFIRM
-        await save_session(chat_id, session)
+---PROMPT---
+黑色背景产品渐现，镜头推近展示细节，产品旋转展示质感，拉远悬浮光粒子，科技感收尾。竖屏9:16。"""
+        }]
+        script_response = await claude_chat(script_prompt, system=SYSTEM_PROMPT)
 
-        ratio_label = "横屏 16:9" if draft.get("ratio") == "16:9" else "竖屏 9:16"
-        await send_text(chat_id,
-            f"好的！我整理了你的视频脚本：\n\n"
-            f"────────────────\n"
-            f"📽 画面：{draft.get('scene')}\n"
-            f"🎨 风格：{draft.get('style')}\n"
-            f"⏱ 时长：{draft.get('duration')}秒\n"
-            f"📐 比例：{ratio_label}\n"
-            f"────────────────\n\n"
-            f"确认开始生成吗？\n"
-            f"回复「确认」开始生成\n"
-            f"回复「修改」重新描述"
-        )
+        if "---PROMPT---" in script_response:
+            parts = script_response.split("---PROMPT---")
+            script_display = parts[0].strip()
+            seedance_prompt = parts[1].strip()
+        else:
+            script_display = script_response
+            seedance_prompt = script_response
 
+        duration = 5
+        ratio = "9:16"
+        if "16:9" in script_response:
+            ratio = "16:9"
+        if "10s" in script_response or "10秒" in script_response:
+            duration = 10
 
-# ══════════════════════════════════════════════════════════
-#  状态3：等待确认脚本
-# ══════════════════════════════════════════════════════════
-
-async def handle_confirm(chat_id: str, session: dict, user_text: str):
-    if any(k in user_text for k in ["确认", "好的", "可以", "开始", "ok", "OK", "是", "没问题"]):
-        # 用户确认，开始生成
-        draft = session.get("script_draft", {})
-        prompt = build_prompt(draft)
-        session["state"] = STATE_GENERATING
-        session["original_prompt"] = prompt
-        session["current_prompt"] = prompt
+        history.append({"role": "assistant", "content": script_response})
+        session["state"] = STATE_SCRIPT_READY
+        session["script_display"] = script_display
+        session["seedance_prompt"] = seedance_prompt
+        session["duration"] = duration
+        session["ratio"] = ratio
+        session["chat_history"] = history
         session["version"] = 0
         session["video_url"] = None
         session["history"] = []
         await save_session(chat_id, session)
 
+        await send_text(chat_id,
+            f"好的！我为你创作了以下脚本：\n\n"
+            f"{script_display}\n\n"
+            f"────────────────\n"
+            f"满意请回复「确认」开始生成视频\n"
+            f"需要修改请直接告诉我哪里需要调整\n"
+            f"想重来请回复「重新创作」"
+        )
+    else:
+        # 继续收集信息
+        reply = await claude_chat(history, system=SYSTEM_PROMPT)
+        history.append({"role": "assistant", "content": reply})
+        session["state"] = STATE_CREATING
+        session["chat_history"] = history
+        await save_session(chat_id, session)
+        await send_text(chat_id, reply)
+
+
+# ══════════════════════════════════════════════════════════
+#  状态3：等待用户确认脚本
+#  严格规则：只有明确说「确认」才生成，其他都当修改意见
+# ══════════════════════════════════════════════════════════
+
+async def handle_script_confirm(chat_id: str, session: dict, user_text: str):
+
+    # 重新创作
+    if any(k in user_text for k in ["重新创作", "重新来", "重写", "推倒重来"]):
+        session["state"] = STATE_CREATING
+        session["chat_history"] = []
+        await save_session(chat_id, session)
+        await send_text(chat_id, "好的，我们重新来！请告诉我你想做什么样的视频？")
+        return
+
+    # 严格判断是否是「确认」
+    is_confirm = any(k in user_text for k in CONFIRM_KEYWORDS)
+
+    if is_confirm:
+        # 用户明确确认，开始生成
+        session["state"] = STATE_GENERATING
+        await save_session(chat_id, session)
         await send_text(chat_id, "好的！开始生成视频，大约需要 1～3 分钟，请稍候…")
 
         task_id = await submit_seedance(
-            prompt,
-            duration=draft.get("duration", 5),
-            aspect_ratio=draft.get("ratio", "16:9")
+            session["seedance_prompt"],
+            duration=session.get("duration", 5),
+            aspect_ratio=session.get("ratio", "9:16")
         )
         if not task_id:
-            session["state"] = STATE_IDLE
+            session["state"] = STATE_SCRIPT_READY
             await save_session(chat_id, session)
-            await send_text(chat_id, "视频任务提交失败，请重试。")
+            await send_text(chat_id, "视频任务提交失败，请回复「确认」重试。")
             return
 
         asyncio.create_task(poll_and_notify(chat_id, task_id, session, is_first=True))
 
-    elif any(k in user_text for k in ["修改", "重新", "不对", "不是", "改"]):
-        # 用户要修改脚本
-        session["state"] = STATE_COLLECT
-        session["script_draft"] = {}
-        await save_session(chat_id, session)
-        await send_text(chat_id,
-            "好的，重新来一次！\n\n"
-            "请告诉我：\n"
-            "1. 画面内容是什么？\n"
-            "2. 风格偏好？\n"
-            "3. 时长？（5秒 或 10秒）\n"
-            "4. 横屏还是竖屏？"
-        )
     else:
-        await send_text(chat_id, "请回复「确认」开始生成，或回复「修改」重新填写脚本。")
+        # 不是确认，当作修改意见处理
+        history = session.get("chat_history", [])
+        history.append({
+            "role": "user",
+            "content": f"请根据以下意见修改脚本：{user_text}\n\n修改后按照原格式输出完整脚本，包含---PROMPT---分隔线和提示词。"
+        })
+
+        script_response = await claude_chat(history, system=SYSTEM_PROMPT)
+
+        if "---PROMPT---" in script_response:
+            parts = script_response.split("---PROMPT---")
+            script_display = parts[0].strip()
+            seedance_prompt = parts[1].strip()
+        else:
+            script_display = script_response
+            seedance_prompt = script_response
+
+        if "16:9" in script_response:
+            session["ratio"] = "16:9"
+        if "9:16" in script_response:
+            session["ratio"] = "9:16"
+
+        history.append({"role": "assistant", "content": script_response})
+        session["script_display"] = script_display
+        session["seedance_prompt"] = seedance_prompt
+        session["chat_history"] = history
+        await save_session(chat_id, session)
+
+        await send_text(chat_id,
+            f"好的，更新后的脚本：\n\n"
+            f"{script_display}\n\n"
+            f"────────────────\n"
+            f"满意请回复「确认」开始生成\n"
+            f"需要继续调整请直接告诉我"
+        )
 
 
 # ══════════════════════════════════════════════════════════
-#  状态4：审核视频 - 处理修改意见
+#  状态4：审核视频
 # ══════════════════════════════════════════════════════════
 
 async def handle_review(chat_id: str, session: dict, user_text: str):
-    if any(k in user_text for k in ["满意", "好的", "不错", "可以", "确认", "完成", "棒", "赞", "通过"]):
-        # 用户满意，结束
+    if any(k in user_text for k in APPROVE_KEYWORDS):
         await send_card(chat_id,
             title="视频已确认 ✓",
             body=f"太好了！第 {session['version']} 版视频已确认。\n\n**视频地址：**\n{session['video_url']}",
             color="green"
         )
         await delete_session(chat_id)
-    else:
-        # 用户提出修改意见，整理新脚本让用户确认
-        feedback = user_text
-        old_prompt = session.get("current_prompt", "")
+        return
 
-        new_prompt = (
-            f"{session.get('original_prompt', '')}。"
-            f"在此基础上做以下调整：{feedback}。"
-            f"保持整体风格不变，重点修改上述内容。"
-        )
+    # 提出修改意见
+    feedback = user_text
+    old_prompt = session.get("seedance_prompt", "")
 
-        session["pending_prompt"] = new_prompt
-        session["pending_feedback"] = feedback
-        session["state"] = STATE_MOD_CONFIRM
-        await save_session(chat_id, session)
+    update_messages = [{
+        "role": "user",
+        "content": f"原来的视频提示词是：{old_prompt}\n\n用户看了视频后说：{feedback}\n\n请根据反馈优化提示词，只输出新的提示词，不要其他内容。"
+    }]
+    new_prompt = await claude_chat(update_messages, system="你是视频提示词优化专家，根据用户反馈优化提示词，只输出提示词。")
 
-        await send_text(chat_id,
-            f"收到修改意见！\n\n"
-            f"────────────────\n"
-            f"修改要求：{feedback}\n"
-            f"────────────────\n\n"
-            f"确认生成第 {session['version'] + 1} 版吗？\n"
-            f"回复「确认」开始生成\n"
-            f"回复「取消」保留当前版本"
-        )
+    session["pending_prompt"] = new_prompt
+    session["pending_feedback"] = feedback
+    session["state"] = STATE_MOD_CONFIRM
+    await save_session(chat_id, session)
+
+    await send_text(chat_id,
+        f"收到！\n\n"
+        f"修改意见：「{feedback}」\n\n"
+        f"已根据你的意见调整了方案。\n\n"
+        f"回复「确认」生成第 {session['version'] + 1} 版\n"
+        f"回复「取消」保留当前版本"
+    )
 
 
 # ══════════════════════════════════════════════════════════
-#  状态5：等待确认修改脚本
+#  状态5：确认修改后生成
 # ══════════════════════════════════════════════════════════
 
 async def handle_mod_confirm(chat_id: str, session: dict, user_text: str):
-    if any(k in user_text for k in ["确认", "好的", "可以", "开始", "ok", "OK", "是"]):
+    if any(k in user_text for k in CONFIRM_KEYWORDS):
         new_prompt = session.get("pending_prompt", "")
         feedback = session.get("pending_feedback", "")
 
         session["history"].append({
             "version":   session["version"],
             "video_url": session["video_url"],
-            "prompt":    session["current_prompt"],
+            "prompt":    session["seedance_prompt"],
             "feedback":  feedback,
         })
-        session["current_prompt"] = new_prompt
+        session["seedance_prompt"] = new_prompt
         session["state"] = STATE_GENERATING
         await save_session(chat_id, session)
 
         await send_text(chat_id, f"好的！正在生成第 {session['version'] + 1} 版，请稍候…")
 
-        task_id = await submit_seedance(new_prompt)
+        task_id = await submit_seedance(
+            new_prompt,
+            duration=session.get("duration", 5),
+            aspect_ratio=session.get("ratio", "9:16")
+        )
         if not task_id:
             session["state"] = STATE_REVIEW
             await save_session(chat_id, session)
-            await send_text(chat_id, "任务提交失败，请重试。")
+            await send_text(chat_id, "任务提交失败，请回复「确认」重试。")
             return
 
         asyncio.create_task(poll_and_notify(chat_id, task_id, session, is_first=False))
 
-    elif any(k in user_text for k in ["取消", "不了", "算了"]):
+    elif any(k in user_text for k in CANCEL_KEYWORDS):
         session["state"] = STATE_REVIEW
         await save_session(chat_id, session)
         await send_text(chat_id, f"好的，保留当前第 {session['version']} 版视频。\n如需修改请继续告诉我。")
+
     else:
         await send_text(chat_id, "请回复「确认」开始生成，或回复「取消」保留当前版本。")
 
 
 # ══════════════════════════════════════════════════════════
-#  豆包 API
+#  Claude API
 # ══════════════════════════════════════════════════════════
 
-async def detect_intent(user_text: str) -> str:
-    """判断用户意图：make_video 或 chat"""
-    prompt = f"""判断用户消息的意图，只返回以下其中一个词：
-- make_video：用户想要制作、生成、创建视频
-- chat：其他所有情况（聊天、提问、闲聊等）
-
-用户消息：「{user_text}」
-
-只返回 make_video 或 chat，不要其他内容。"""
-
-    result = await doubao_chat(prompt, system="你是意图识别助手，只输出指定的词。")
-    result = result.strip().lower()
-    if "make_video" in result:
-        return "make_video"
-    return "chat"
-
-
-async def doubao_chat(user_msg: str, system: str = "你是一个helpful助手。") -> str:
-    """调用豆包对话接口"""
+async def claude_chat(messages: list, system: str = SYSTEM_PROMPT) -> str:
     headers = {
-        "Authorization": f"Bearer {VOLCANO_API_KEY}",
-        "Content-Type":  "application/json"
+        "x-api-key":         CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type":      "application/json"
     }
     payload = {
-        "model": DOUBAO_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user_msg}
-        ],
-        "max_tokens": 500
+        "model":      CLAUDE_MODEL,
+        "max_tokens": 1000,
+        "system":     system,
+        "messages":   messages
     }
     try:
-        resp = await http_client.post(VOLCANO_CHAT_URL, json=payload, headers=headers)
+        resp = await http_client.post(CLAUDE_API_URL, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        return data["content"][0]["text"]
     except Exception as e:
-        log.error(f"豆包调用失败：{e}")
+        log.error(f"Claude 调用失败：{e}")
         return "抱歉，我暂时无法回复，请稍后再试。"
 
 
@@ -403,17 +417,7 @@ async def doubao_chat(user_msg: str, system: str = "你是一个helpful助手。
 #  Seedance API
 # ══════════════════════════════════════════════════════════
 
-def build_prompt(draft: dict) -> str:
-    """把脚本草稿拼成 Seedance prompt"""
-    parts = []
-    if draft.get("scene"):
-        parts.append(draft["scene"])
-    if draft.get("style"):
-        parts.append(f"{draft['style']}风格")
-    return "，".join(parts)
-
-
-async def submit_seedance(prompt: str, duration: int = 5, aspect_ratio: str = "16:9") -> Optional[str]:
+async def submit_seedance(prompt: str, duration: int = 5, aspect_ratio: str = "9:16") -> Optional[str]:
     payload = {
         "model":     SEEDANCE_MODEL,
         "content":   [{"type": "text", "text": prompt}],
@@ -472,9 +476,9 @@ async def poll_and_notify(chat_id: str, task_id: str, session: dict, is_first: b
                 await save_session(chat_id, session)
                 await notify_done(chat_id, video_url, version, is_first)
             else:
-                session["state"] = STATE_IDLE
+                session["state"] = STATE_SCRIPT_READY
                 await save_session(chat_id, session)
-                await send_text(chat_id, "视频生成完成，但获取地址时出错，请重试。")
+                await send_text(chat_id, "视频生成完成，但获取地址出错，请回复「确认」重试。")
             return
 
         elif status == "failed":
@@ -490,7 +494,7 @@ async def poll_and_notify(chat_id: str, task_id: str, session: dict, is_first: b
 
     session["state"] = STATE_IDLE
     await save_session(chat_id, session)
-    await send_text(chat_id, "视频生成超时（超过 10 分钟），请重新发送需求。")
+    await send_text(chat_id, "视频生成超时，请重新发送需求。")
 
 
 # ══════════════════════════════════════════════════════════
@@ -555,7 +559,7 @@ async def notify_done(chat_id: str, video_url: str, version: int, is_first: bool
         f"**点击查看视频：**\n{video_url}\n\n"
         "---\n"
         "**满意了吗？**\n"
-        "- 需要修改 → 直接告诉我修改意见\n"
+        "- 需要修改 → 直接告诉我修改意见，我会重新调整方案让你确认\n"
         "- 已经满意 → 回复「满意」完成流程"
     )
     await send_card(chat_id, title=title, body=body, color=color)
