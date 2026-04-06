@@ -35,7 +35,7 @@ CLAUDE_API_KEY    = os.getenv("CLAUDE_API_KEY")
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 SEEDANCE_MODEL    = "doubao-seedance-1-5-pro-251215"
-VOLCANO_VIDEO_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+VOLCANO_VIDEO_URL = "https://ark.ap-southeast-1.volces.com/api/v3/contents/generations/tasks"
 CLAUDE_API_URL    = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL      = "claude-sonnet-4-5"
 
@@ -43,7 +43,7 @@ CLAUDE_MODEL      = "claude-sonnet-4-5"
 TOS_ACCESS_KEY = os.getenv("TOS_ACCESS_KEY")
 TOS_SECRET_KEY = os.getenv("TOS_SECRET_KEY")
 TOS_BUCKET     = os.getenv("TOS_BUCKET")
-TOS_ENDPOINT   = os.getenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+TOS_ENDPOINT   = os.getenv("TOS_ENDPOINT", "tos-ap-southeast-1.volces.com")
 
 STATE_CHATTING   = "chatting"
 STATE_GENERATING = "generating"
@@ -285,13 +285,13 @@ async def upload_to_tos(file_bytes: bytes, filename: str, content_type: str = "i
             f"content-type;host;x-tos-date\n"
             + hashlib.sha256(file_bytes).hexdigest()
         )
-        credential_scope  = f"{date_str}/cn-beijing/tos/request"
+        credential_scope  = f"{date_str}/ap-southeast-1/tos/request"
         string_to_sign    = f"TOS4-HMAC-SHA256\n{time_str}\n{credential_scope}\n" + hashlib.sha256(canonical_request.encode()).hexdigest()
 
         def hmac_sha256(key, msg):
             return hmac_lib.new(key if isinstance(key, bytes) else key.encode(), msg.encode(), hashlib.sha256).digest()
 
-        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "cn-beijing"), "tos"), "request")
+        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "ap-southeast-1"), "tos"), "request")
         signature   = hmac_lib.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
 
         auth = (
@@ -340,13 +340,13 @@ async def delete_from_tos(filename: str):
             f"host;x-tos-date\n"
             + hashlib.sha256(b"").hexdigest()
         )
-        credential_scope = f"{date_str}/cn-beijing/tos/request"
+        credential_scope = f"{date_str}/ap-southeast-1/tos/request"
         string_to_sign   = f"TOS4-HMAC-SHA256\n{time_str}\n{credential_scope}\n" + hashlib.sha256(canonical_request.encode()).hexdigest()
 
         def hmac_sha256(key, msg):
             return hmac_lib.new(key if isinstance(key, bytes) else key.encode(), msg.encode(), hashlib.sha256).digest()
 
-        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "cn-beijing"), "tos"), "request")
+        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "ap-southeast-1"), "tos"), "request")
         signature   = hmac_lib.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
 
         auth = (
@@ -481,7 +481,7 @@ async def extract_video_frames(video_bytes: bytes) -> list:
         os.remove(video_path)
         log.info(f"成功提取 {len(frames)} 帧")
     except FileNotFoundError:
-        log.error("ffmpeg 未安装，请在 Procfile 中添加 ffmpeg 安装命令")
+        log.info("ffmpeg 未安装，跳过提帧，使用文字模式")
     except Exception as e:
         log.error(f"ffmpeg 抽帧失败：{e}", exc_info=True)
 
