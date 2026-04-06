@@ -447,43 +447,35 @@ async def download_feishu_file(message_id: str, file_key: str) -> Optional[bytes
 
 
 async def extract_video_frames(video_bytes: bytes) -> list:
-    """用 ffmpeg 从视频中抽取 3 帧，返回 base64 列表"""
-    import tempfile, subprocess, os
+    """用 opencv 从视频中抽取 3 帧，返回 base64 列表"""
+    import tempfile, os
+    import cv2
     frames = []
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(video_bytes)
             video_path = vf.name
 
-        # 先用 ffprobe 探测视频时长
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, timeout=10
-        )
-        duration = float(probe.stdout.strip() or "10")
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = 30
 
         # 抽开头、中间、结尾三帧
-        timestamps = [1, duration / 2, max(duration - 1, 1)]
+        positions = [1, total_frames // 2, max(total_frames - 2, 1)]
 
-        for i, ts in enumerate(timestamps):
-            out_path = f"{video_path}_frame{i}.jpg"
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
-                 "-vframes", "1", "-q:v", "2", out_path],
-                capture_output=True, timeout=30
-            )
-            if result.returncode == 0 and os.path.exists(out_path):
-                with open(out_path, "rb") as f:
-                    frames.append(base64.b64encode(f.read()).decode("utf-8"))
-                os.remove(out_path)
+        for pos in positions:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            ret, frame = cap.read()
+            if ret:
+                _, buf = cv2.imencode(".jpg", frame)
+                frames.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
 
+        cap.release()
         os.remove(video_path)
-        log.info(f"成功提取 {len(frames)} 帧")
-    except FileNotFoundError:
-        log.info("ffmpeg 未安装，跳过提帧，使用文字模式")
+        log.info(f"opencv 成功提取 {len(frames)} 帧")
     except Exception as e:
-        log.error(f"ffmpeg 抽帧失败：{e}", exc_info=True)
+        log.error(f"opencv 抽帧失败：{e}", exc_info=True)
 
     return frames
 
