@@ -237,7 +237,7 @@ async def handle_image(chat_id: str, session: dict, msg: dict, raw_content: dict
         image_url = await upload_to_tos(base64.b64decode(image_data), filename, "image/jpeg")
         if image_url:
             session["ref_image_url"]  = image_url
-            session["ref_image_file"] = filename  # 记录文件名，用于后续删除
+            session["ref_image_file"] = filename
             log.info(f"图片已保存到 TOS：{image_url}")
 
         # 2. 同时把图片发给 Claude 分析
@@ -283,7 +283,6 @@ async def upload_to_tos(file_bytes: bytes, filename: str, content_type: str = "i
         host      = f"{TOS_BUCKET}.{TOS_ENDPOINT}"
         url       = f"https://{host}/{filename}"
 
-        # 构建签名（TOS V4 签名）
         canonical_request = (
             f"PUT\n/{filename}\n\n"
             f"content-type:{content_type}\n"
@@ -382,7 +381,7 @@ async def download_feishu_image(message_id: str, image_key: str) -> Optional[str
 
 
 # ══════════════════════════════════════════════════════════
-#  检测到 Seedance 指令，执行拍摄
+#  处理视频消息
 # ══════════════════════════════════════════════════════════
 
 async def handle_video(chat_id: str, session: dict, msg: dict, raw_content: dict):
@@ -460,27 +459,28 @@ async def extract_video_frames(video_bytes: bytes) -> list:
     import tempfile, subprocess, os
     frames = []
     try:
-        # 写入临时文件
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(video_bytes)
             video_path = vf.name
 
-        # 抽取 3 帧：开头、中间、结尾
-        for i, timestamp in enumerate(["00:00:00", "50%", "99%"]):
-            out_path = f"{video_path}_frame{i}.jpg"
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", timestamp if "%" not in timestamp else "0",
-                "-i", video_path,
-                "-vframes", "1",
-                "-q:v", "2",
-                out_path
-            ]
-            if "%" in timestamp:
-                # 用 -sseof 取结尾帧
-                cmd = ["ffmpeg", "-y", "-sseof", "-1", "-i", video_path, "-vframes", "1", "-q:v", "2", out_path]
+        # 先用 ffprobe 探测视频时长
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=10
+        )
+        duration = float(probe.stdout.strip() or "10")
 
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
+        # 抽开头、中间、结尾三帧
+        timestamps = [1, duration / 2, max(duration - 1, 1)]
+
+        for i, ts in enumerate(timestamps):
+            out_path = f"{video_path}_frame{i}.jpg"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
+                 "-vframes", "1", "-q:v", "2", out_path],
+                capture_output=True, timeout=30
+            )
             if result.returncode == 0 and os.path.exists(out_path):
                 with open(out_path, "rb") as f:
                     frames.append(base64.b64encode(f.read()).decode("utf-8"))
@@ -488,21 +488,25 @@ async def extract_video_frames(video_bytes: bytes) -> list:
 
         os.remove(video_path)
         log.info(f"成功提取 {len(frames)} 帧")
+    except FileNotFoundError:
+        log.error("ffmpeg 未安装，请在 nixpacks.toml 中添加 ffmpeg")
     except Exception as e:
         log.error(f"ffmpeg 抽帧失败：{e}")
 
     return frames
 
 
+# ══════════════════════════════════════════════════════════
+#  检测到 Seedance 指令，执行拍摄
+# ══════════════════════════════════════════════════════════
+
 async def handle_seedance_trigger(chat_id: str, session: dict, history: list, reply: str):
     """Claude 输出了拍摄指令，解析并提交 Seedance 任务"""
     try:
-        # 解析 prompt
         start = reply.index("[SEEDANCE_START]") + len("[SEEDANCE_START]")
         end   = reply.index("[SEEDANCE_END]")
         prompt = reply[start:end].strip()
 
-        # 解析时长（Seedance 只支持 4/5/6/8/10 秒）
         valid_durations = [4, 5, 6, 8, 10]
         duration = 5
         if "[DURATION:" in reply:
@@ -520,7 +524,6 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
                 return
             duration = raw_dur
 
-        # 解析比例
         ratio = "9:16"
         if "[RATIO:" in reply:
             r_start = reply.index("[RATIO:") + len("[RATIO:")
@@ -534,11 +537,9 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
         await send_text(chat_id, "脚本格式有点问题，Claude 正在重新整理，请稍候…")
         return
 
-    # 从 session 取出用户上传的素材 URL
     ref_image_url = session.get("ref_image_url")
     ref_video_url = session.get("ref_video_url")
 
-    # 告知用户使用了哪种模式
     if ref_image_url and ref_video_url:
         mode_text = "图片 + 视频参考"
     elif ref_image_url:
@@ -548,7 +549,6 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
     else:
         mode_text = "纯文字脚本"
 
-    # 保存当前版本信息
     version = session.get("version", 0) + 1
     session["history"]        = history[-20:]
     session["state"]          = STATE_GENERATING
@@ -567,7 +567,6 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
         f"大约需要 1～3 分钟，请稍候…"
     )
 
-    # 提交任务
     task_id = await submit_seedance(
         prompt,
         duration=duration,
@@ -621,14 +620,6 @@ async def submit_seedance(
     image_url: str = None,
     video_url: str = None
 ) -> Optional[str]:
-    """
-    提交 Seedance 任务，支持三种模式：
-    - 文生视频：只有 prompt
-    - 图生视频：image_url + prompt
-    - 视频生视频：video_url + prompt
-    - 混合：image_url + video_url + prompt
-    """
-    # 构建 content 列表
     content = []
 
     if image_url:
@@ -708,13 +699,11 @@ async def poll_and_notify(chat_id: str, task_id: str, session: dict, is_first: b
                 session["state"]     = STATE_CHATTING
                 await save_session(chat_id, session)
 
-                # 自动清理 TOS 临时素材（节省存储费用）
                 if session.get("ref_image_file"):
                     asyncio.create_task(delete_from_tos(session["ref_image_file"]))
                 if session.get("ref_video_file"):
                     asyncio.create_task(delete_from_tos(session["ref_video_file"]))
 
-                # 把视频结果告知 Claude，让它来回复用户
                 history = session.get("history", [])
                 history.append({
                     "role": "user",
