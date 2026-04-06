@@ -201,20 +201,16 @@ async def handle_text(chat_id: str, session: dict, text: str):
     history = session.get("history", [])
     history.append({"role": "user", "content": text})
 
-    # 调用 Claude
     reply = await claude_chat(history, system=DIRECTOR_PROMPT)
     history.append({"role": "assistant", "content": reply})
 
-    # 检查 Claude 是否输出了 Seedance 指令
     if "[SEEDANCE_START]" in reply and "[SEEDANCE_END]" in reply:
         await handle_seedance_trigger(chat_id, session, history, reply)
     else:
-        # 普通对话回复
-        session["history"] = history[-20:]  # 保留最近20条
+        session["history"] = history[-20:]
         session["state"]   = STATE_CHATTING
         await save_session(chat_id, session)
 
-        # 去掉可能残留的标记，发送干净的回复
         clean_reply = reply.replace("[SEEDANCE_START]", "").replace("[SEEDANCE_END]", "").strip()
         await send_text(chat_id, clean_reply)
 
@@ -232,7 +228,6 @@ async def handle_image(chat_id: str, session: dict, msg: dict, raw_content: dict
     history    = session.get("history", [])
 
     if image_data:
-        # 1. 上传到 TOS 拿到公开 URL（供 Seedance 图生视频用）
         filename  = f"ref_image_{chat_id}_{int(time.time())}.jpg"
         image_url = await upload_to_tos(base64.b64decode(image_data), filename, "image/jpeg")
         if image_url:
@@ -240,7 +235,6 @@ async def handle_image(chat_id: str, session: dict, msg: dict, raw_content: dict
             session["ref_image_file"] = filename
             log.info(f"图片已保存到 TOS：{image_url}")
 
-        # 2. 同时把图片发给 Claude 分析
         message_content = [
             {
                 "type": "image",
@@ -322,7 +316,7 @@ async def upload_to_tos(file_bytes: bytes, filename: str, content_type: str = "i
             log.error(f"❌ TOS 上传失败：{resp.status_code} {resp.text}")
             return None
     except Exception as e:
-        log.error(f"❌ TOS 上传异常：{e}")
+        log.error(f"❌ TOS 上传异常：{e}", exc_info=True)
         return None
 
 
@@ -362,7 +356,7 @@ async def delete_from_tos(filename: str):
         await http_client.delete(url, headers={"Host": host, "x-tos-date": time_str, "Authorization": auth})
         log.info(f"🗑 TOS 文件已删除：{filename}")
     except Exception as e:
-        log.error(f"TOS 删除失败：{e}")
+        log.error(f"TOS 删除失败：{e}", exc_info=True)
 
 
 async def download_feishu_image(message_id: str, image_key: str) -> Optional[str]:
@@ -376,7 +370,7 @@ async def download_feishu_image(message_id: str, image_key: str) -> Optional[str
         log.error(f"图片下载失败：{resp.status_code}")
         return None
     except Exception as e:
-        log.error(f"图片下载异常：{e}")
+        log.error(f"图片下载异常：{e}", exc_info=True)
         return None
 
 
@@ -394,7 +388,6 @@ async def handle_video(chat_id: str, session: dict, msg: dict, raw_content: dict
     history     = session.get("history", [])
 
     if video_bytes:
-        # 1. 上传到 TOS 拿到公开 URL（供 Seedance 视频生视频用）
         filename  = f"ref_video_{chat_id}_{int(time.time())}.mp4"
         video_url = await upload_to_tos(video_bytes, filename, "video/mp4")
         if video_url:
@@ -402,7 +395,6 @@ async def handle_video(chat_id: str, session: dict, msg: dict, raw_content: dict
             session["ref_video_file"] = filename
             log.info(f"视频已保存到 TOS：{video_url}")
 
-        # 2. 用 ffmpeg 抽帧给 Claude 分析
         frames = await extract_video_frames(video_bytes)
         if frames:
             content = []
@@ -450,7 +442,7 @@ async def download_feishu_file(message_id: str, file_key: str) -> Optional[bytes
         log.error(f"视频下载失败：{resp.status_code}")
         return None
     except Exception as e:
-        log.error(f"视频下载异常：{e}")
+        log.error(f"视频下载异常：{e}", exc_info=True)
         return None
 
 
@@ -489,9 +481,9 @@ async def extract_video_frames(video_bytes: bytes) -> list:
         os.remove(video_path)
         log.info(f"成功提取 {len(frames)} 帧")
     except FileNotFoundError:
-        log.error("ffmpeg 未安装，请在 nixpacks.toml 中添加 ffmpeg")
+        log.error("ffmpeg 未安装，请在 Procfile 中添加 ffmpeg 安装命令")
     except Exception as e:
-        log.error(f"ffmpeg 抽帧失败：{e}")
+        log.error(f"ffmpeg 抽帧失败：{e}", exc_info=True)
 
     return frames
 
@@ -533,7 +525,7 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
         log.info(f"Seedance 指令解析成功 duration={duration} ratio={ratio} prompt={prompt[:50]}")
 
     except Exception as e:
-        log.error(f"Seedance 指令解析失败：{e}")
+        log.error(f"Seedance 指令解析失败：{e}", exc_info=True)
         await send_text(chat_id, "脚本格式有点问题，Claude 正在重新整理，请稍候…")
         return
 
@@ -605,7 +597,7 @@ async def claude_chat(messages: list, system: str = DIRECTOR_PROMPT) -> str:
         data = resp.json()
         return data["content"][0]["text"]
     except Exception as e:
-        log.error(f"Claude 调用失败：{e}")
+        log.error(f"Claude 调用失败：{e}", exc_info=True)
         return "抱歉，我暂时无法回复，请稍后再试。"
 
 
@@ -662,7 +654,7 @@ async def submit_seedance(
         log.info(f"✅ 视频任务已提交 task_id={task_id}")
         return task_id
     except Exception as e:
-        log.error(f"❌ 视频任务提交失败：{e}")
+        log.error(f"❌ 视频任务提交失败：{e}", exc_info=True)
         return None
 
 
@@ -674,7 +666,7 @@ async def query_seedance(task_id: str) -> dict:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.error(f"查询失败：{e}")
+        log.error(f"查询失败：{e}", exc_info=True)
         return {}
 
 
