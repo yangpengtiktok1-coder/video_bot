@@ -21,7 +21,7 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 
 load_dotenv()
 
@@ -114,10 +114,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": int(time.time())}
+
+
+@app.post("/claude/proxy")
+async def claude_proxy(request: Request):
+    body = await request.body()
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    resp = await http_client.post(
+        "https://api.anthropic.com/v1/messages",
+        content=body,
+        headers=headers
+    )
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
 
 
 @app.post("/feishu/event")
