@@ -124,6 +124,7 @@ async def claude_proxy(request: Request):
     body = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
+    headers["accept-encoding"] = "identity"
     resp = await http_client.post(
         "https://api.anthropic.com/v1/messages",
         content=body,
