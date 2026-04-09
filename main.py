@@ -35,7 +35,7 @@ CLAUDE_API_KEY    = os.getenv("CLAUDE_API_KEY")
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 SEEDANCE_MODEL    = "doubao-seedance-1-5-pro-251215"
-VOLCANO_VIDEO_URL = "https://ark.ap-southeast-1.volces.com/api/v3/contents/generations/tasks"
+VOLCANO_VIDEO_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
 CLAUDE_API_URL    = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL      = "claude-sonnet-4-5"
 
@@ -278,56 +278,24 @@ async def handle_image(chat_id: str, session: dict, msg: dict, raw_content: dict
 
 
 async def upload_to_tos(file_bytes: bytes, filename: str, content_type: str = "image/jpeg") -> Optional[str]:
-    """上传文件到火山引擎 TOS，返回公开访问 URL"""
+    """上传文件到火山引擎 TOS，使用官方 SDK"""
     try:
-        import hmac as hmac_lib
-        import hashlib
-        from datetime import datetime, timezone
-
-        now       = datetime.now(timezone.utc)
-        date_str  = now.strftime("%Y%m%d")
-        time_str  = now.strftime("%Y%m%dT%H%M%SZ")
-        host      = f"{TOS_BUCKET}.{TOS_ENDPOINT}"
-        url       = f"https://{host}/{filename}"
-
-        canonical_request = (
-            f"PUT\n/{filename}\n\n"
-            f"content-type:{content_type}\n"
-            f"host:{host}\n"
-            f"x-tos-date:{time_str}\n\n"
-            f"content-type;host;x-tos-date\n"
-            + hashlib.sha256(file_bytes).hexdigest()
+        import tos, io
+        client = tos.TosClientV2(
+            ak=TOS_ACCESS_KEY,
+            sk=TOS_SECRET_KEY,
+            endpoint=TOS_ENDPOINT,
+            region="ap-southeast-1"
         )
-        credential_scope  = f"{date_str}/ap-southeast-1/tos/request"
-        string_to_sign    = f"TOS4-HMAC-SHA256\n{time_str}\n{credential_scope}\n" + hashlib.sha256(canonical_request.encode()).hexdigest()
-
-        def hmac_sha256(key, msg):
-            return hmac_lib.new(key if isinstance(key, bytes) else key.encode(), msg.encode(), hashlib.sha256).digest()
-
-        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "ap-southeast-1"), "tos"), "request")
-        signature   = hmac_lib.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
-
-        auth = (
-            f"TOS4-HMAC-SHA256 Credential={TOS_ACCESS_KEY}/{credential_scope},"
-            f"SignedHeaders=content-type;host;x-tos-date,Signature={signature}"
+        client.put_object(
+            bucket=TOS_BUCKET,
+            key=filename,
+            content=io.BytesIO(file_bytes),
+            content_type=content_type
         )
-
-        resp = await http_client.put(
-            url,
-            content=file_bytes,
-            headers={
-                "Host":          host,
-                "Content-Type":  content_type,
-                "x-tos-date":    time_str,
-                "Authorization": auth,
-            }
-        )
-        if resp.status_code in (200, 204):
-            log.info(f"✅ TOS 上传成功：{url}")
-            return url
-        else:
-            log.error(f"❌ TOS 上传失败：{resp.status_code} {resp.text}")
-            return None
+        url = f"https://{TOS_BUCKET}.{TOS_ENDPOINT}/{filename}"
+        log.info(f"✅ TOS 上传成功：{url}")
+        return url
     except Exception as e:
         log.error(f"❌ TOS 上传异常：{e}", exc_info=True)
         return None
@@ -336,37 +304,14 @@ async def upload_to_tos(file_bytes: bytes, filename: str, content_type: str = "i
 async def delete_from_tos(filename: str):
     """生成完视频后删除 TOS 临时文件"""
     try:
-        import hmac as hmac_lib
-        import hashlib
-        from datetime import datetime, timezone
-
-        now      = datetime.now(timezone.utc)
-        date_str = now.strftime("%Y%m%d")
-        time_str = now.strftime("%Y%m%dT%H%M%SZ")
-        host     = f"{TOS_BUCKET}.{TOS_ENDPOINT}"
-        url      = f"https://{host}/{filename}"
-
-        canonical_request = (
-            f"DELETE\n/{filename}\n\n"
-            f"host:{host}\n"
-            f"x-tos-date:{time_str}\n\n"
-            f"host;x-tos-date\n"
-            + hashlib.sha256(b"").hexdigest()
+        import tos
+        client = tos.TosClientV2(
+            ak=TOS_ACCESS_KEY,
+            sk=TOS_SECRET_KEY,
+            endpoint=TOS_ENDPOINT,
+            region="ap-southeast-1"
         )
-        credential_scope = f"{date_str}/ap-southeast-1/tos/request"
-        string_to_sign   = f"TOS4-HMAC-SHA256\n{time_str}\n{credential_scope}\n" + hashlib.sha256(canonical_request.encode()).hexdigest()
-
-        def hmac_sha256(key, msg):
-            return hmac_lib.new(key if isinstance(key, bytes) else key.encode(), msg.encode(), hashlib.sha256).digest()
-
-        signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(f"TOS4{TOS_SECRET_KEY}", date_str), "ap-southeast-1"), "tos"), "request")
-        signature   = hmac_lib.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
-
-        auth = (
-            f"TOS4-HMAC-SHA256 Credential={TOS_ACCESS_KEY}/{credential_scope},"
-            f"SignedHeaders=host;x-tos-date,Signature={signature}"
-        )
-        await http_client.delete(url, headers={"Host": host, "x-tos-date": time_str, "Authorization": auth})
+        client.delete_object(bucket=TOS_BUCKET, key=filename)
         log.info(f"🗑 TOS 文件已删除：{filename}")
     except Exception as e:
         log.error(f"TOS 删除失败：{e}", exc_info=True)
@@ -534,8 +479,10 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
         await send_text(chat_id, "脚本格式有点问题，Claude 正在重新整理，请稍候…")
         return
 
-    ref_image_url = session.get("ref_image_url")
-    ref_video_url = session.get("ref_video_url")
+    # 重新从 Redis 读取最新 session，确保拿到图片/视频 URL
+    fresh_session = await load_session(chat_id)
+    ref_image_url = fresh_session.get("ref_image_url")
+    ref_video_url = fresh_session.get("ref_video_url")
 
     if ref_image_url and ref_video_url:
         mode_text = "图片 + 视频参考"
@@ -546,16 +493,18 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
     else:
         mode_text = "纯文字脚本"
 
-    version = session.get("version", 0) + 1
-    session["history"]        = history[-20:]
-    session["state"]          = STATE_GENERATING
-    session["current_prompt"] = prompt
-    session["duration"]       = duration
-    session["ratio"]          = ratio
-    session["version"]        = version
-    if "result_video_url" not in session:
-        session["result_video_url"] = None
-    await save_session(chat_id, session)
+    log.info(f"ref_image_url={ref_image_url} ref_video_url={ref_video_url} mode={mode_text}")
+
+    version = fresh_session.get("version", 0) + 1
+    fresh_session["history"]        = history[-20:]
+    fresh_session["state"]          = STATE_GENERATING
+    fresh_session["current_prompt"] = prompt
+    fresh_session["duration"]       = duration
+    fresh_session["ratio"]          = ratio
+    fresh_session["version"]        = version
+    if "result_video_url" not in fresh_session:
+        fresh_session["result_video_url"] = None
+    await save_session(chat_id, fresh_session)
 
     is_first = version == 1
     await send_text(chat_id,
@@ -572,12 +521,12 @@ async def handle_seedance_trigger(chat_id: str, session: dict, history: list, re
         video_url=ref_video_url
     )
     if not task_id:
-        session["state"] = STATE_CHATTING
-        await save_session(chat_id, session)
+        fresh_session["state"] = STATE_CHATTING
+        await save_session(chat_id, fresh_session)
         await send_text(chat_id, "视频任务提交失败，请告诉我重新生成。")
         return
 
-    asyncio.create_task(poll_and_notify(chat_id, task_id, session, is_first=is_first))
+    asyncio.create_task(poll_and_notify(chat_id, task_id, fresh_session, is_first=is_first))
 
 
 # ══════════════════════════════════════════════════════════
